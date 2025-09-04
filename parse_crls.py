@@ -4,10 +4,15 @@ import csv
 import json
 import time
 import traceback
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # PDF parsing
-import fitz  # PyMuPDF
+import pymupdf4llm
+
+# Thread lock for PyMuPDF4LLM operations
+_pdf_extraction_lock = threading.Lock()
 
 # OpenRouter via OpenAI client
 import openai
@@ -114,43 +119,33 @@ def call_openrouter_api_simple(
     return response_content, usage
 
 
-def extract_text_signals(doc: fitz.Document, max_chars: int = 20000) -> str:
-    """Return a condensed, high-signal text snippet from the PDF.
-    - Full text of first page
-    - Lines from other pages matching key patterns
-    - Truncated to max_chars
-    """
-    key_patterns = re.compile(
-        r"(complete response|CRL|FDA|application|submitted|NDA|BLA|ANDA|efficacy|safety|risk|benefit|trial|endpoint|manufactur|CMC|deficien|request|respon|sponsor|applicant|drug|biolog)",
-        re.IGNORECASE,
-    )
 
-    parts: List[str] = []
 
-    if len(doc) > 0:
-        try:
-            first = doc.load_page(0)
-            parts.append(first.get_text("text"))
-        except Exception:
-            pass
-
-    for i in range(1, len(doc)):
-        try:
-            page = doc.load_page(i)
-            text = page.get_text("text")
-            lines = []
-            for line in text.splitlines():
-                if key_patterns.search(line):
-                    lines.append(line)
-            if lines:
-                parts.append("\n".join(lines[:50]))
-        except Exception:
-            continue
-
-    joined = "\n\n".join([p for p in parts if p])
-    if len(joined) > max_chars:
-        return joined[:max_chars]
-    return joined
+def extract_markdown_text(pdf_path: str) -> str:
+    """Extract text as markdown using PyMuPDF4LLM with thread safety."""
+    try:
+        # Ensure the file path is absolute and exists
+        if not os.path.isabs(pdf_path):
+            pdf_path = os.path.abspath(pdf_path)
+        
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        
+        # Use thread lock to ensure thread-safe operation
+        with _pdf_extraction_lock:
+            # Extract markdown text
+            markdown_text = pymupdf4llm.to_markdown(pdf_path)
+        
+        if not markdown_text or len(markdown_text.strip()) < 20:
+            raise ValueError(f"Extracted text too short or empty from {os.path.basename(pdf_path)}")
+            
+        return markdown_text
+        
+    except Exception as e:
+        print(f"Error extracting markdown from {os.path.basename(pdf_path)}: {e}")
+        print(f"Error type: {type(e).__name__}")
+        # Re-raise the exception so it can be handled by the calling function
+        raise
 
 
 def build_json_schema() -> Dict[str, Any]:
@@ -159,68 +154,54 @@ def build_json_schema() -> Dict[str, Any]:
         "properties": {
             "drug_name": {"type": "string"},
             "company": {"type": "string"},
-            "date_of_application": {"type": "string", "description": "Prefer YYYY-MM-DD if present; otherwise best-effort"},
-            "reason_for_crl": {"type": "string", "description": "Concise summary of the primary stated reasons"},
-            "category": {"type": "string", "enum": ["efficacy", "safety", "both", "other"]},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence": {
-                "type": "object",
-                "properties": {
-                    "date_source_text": {"type": "string"},
-                    "reason_source_text": {"type": "string"},
-                    "pages_hint": {"type": "array", "items": {"type": "integer"}},
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-            "notes": {"type": "string"},
+            "date": {"type": "string", "description": "Prefer YYYY-MM-DD if present; otherwise best-effort"},
+            "summary": {"type": "string", "description": "Concise summary of the reason for CRL"},
+            "classification": {"type": "string", "enum": ["efficacy", "safety", "others"]},
+            "path_to_future_approval": {"type": "string", "description": "What the sponsor must do to gain future approval"},
         },
-        "required": ["drug_name", "company", "reason_for_crl", "category"],
+        "required": [
+            "drug_name",
+            "company",
+            "date",
+            "summary",
+            "classification",
+            "path_to_future_approval",
+        ],
         "additionalProperties": False,
     }
 
 
 SYSTEM_PROMPT = (
     "You are a precise regulatory analyst extracting key fields from FDA Complete Response Letters (CRLs). "
-    "Return only JSON following the provided schema. If unknown, use empty string and set confidence low. "
-    "Categorize reasons as: efficacy, safety, both, or other (e.g., CMC/manufacturing)."
+    "Return only JSON following the provided schema with exact keys. If a value is unknown, use an empty string. "
+    "Classify the reason using ONLY: efficacy, safety, or others (e.g., CMC/manufacturing/logistics)."
 )
 
 
 USER_PROMPT_TEMPLATE = (
-    "Extract the following from the provided CRL text.\n"
+    "Extract these fields from the CRL text and adhere to the schema: \n"
     "- drug_name\n"
     "- company (applicant/sponsor)\n"
-    "- date_of_application\n"
-    "- reason_for_crl (short summary)\n"
-    "- category (efficacy|safety|both|other)\n\n"
+    "- date (application or key date mentioned)\n"
+    "- summary (concise reason for CRL)\n"
+    "- classification (use exactly one: efficacy | safety | others)\n"
+    "- path_to_future_approval (what is required to gain approval)\n\n"
     "CRL EXCERPTS:\n\n{doc_text}"
 )
 
 
 def parse_pdf_with_llm(pdf_path: str) -> Optional[Dict[str, Any]]:
     try:
-        with fitz.open(pdf_path) as doc:
-            text = extract_text_signals(doc)
+        markdown_text = extract_markdown_text(pdf_path)
     except Exception as e:
-        print(f"Failed to read PDF {pdf_path}: {e}")
+        print(f"Failed to extract text from {os.path.basename(pdf_path)}: {e}")
+        return None
+    
+    if not markdown_text or len(markdown_text.strip()) < 20:
+        print(f"Low/no extractable text for {os.path.basename(pdf_path)}; may be scanned/OCR needed.")
         return None
 
-    if not text or len(text.strip()) < 20:
-        print(f"Low/no extractable text for {os.path.basename(pdf_path)}; may be scanned/OCR needed.")
-        return {
-            "drug_name": "",
-            "company": "",
-            "date_of_application": "",
-            "reason_for_crl": "",
-            "category": "other",
-            "confidence": 0.0,
-            "evidence": {"date_source_text": "", "reason_source_text": "", "pages_hint": []},
-            "notes": "No extractable text; likely scanned PDF without OCR.",
-            "_file": os.path.basename(pdf_path),
-        }
-
-    user_prompt = USER_PROMPT_TEMPLATE.format(doc_text=text)
+    user_prompt = USER_PROMPT_TEMPLATE.format(doc_text=markdown_text)
     schema = build_json_schema()
 
     response, usage = call_openrouter_api_simple(
@@ -250,7 +231,7 @@ def parse_pdf_with_llm(pdf_path: str) -> Optional[Dict[str, Any]]:
             print(f"Failed to parse JSON for {pdf_path}: {e}\nRaw: {response[:500]}...")
             return None
 
-    # Attach filename for traceability
+    # Attach filename for traceability (internal key)
     if isinstance(data, dict):
         data["_file"] = os.path.basename(pdf_path)
     return data
@@ -258,41 +239,29 @@ def parse_pdf_with_llm(pdf_path: str) -> Optional[Dict[str, Any]]:
 
 def write_outputs(rows: List[Dict[str, Any]], out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
-    details_dir = os.path.join(out_dir, "details")
-    os.makedirs(details_dir, exist_ok=True)
-
-    jsonl_path = os.path.join(out_dir, "crl_results.jsonl")
     csv_path = os.path.join(out_dir, "crl_results.csv")
 
-    # JSONL
-    with open(jsonl_path, "w", encoding="utf-8") as jf:
-        for r in rows:
-            jf.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    # CSV
+    # CSV only
     fieldnames = [
-        "_file",
         "drug_name",
         "company",
-        "date_of_application",
-        "reason_for_crl",
-        "category",
-        "confidence",
-        "notes",
+        "date",
+        "summary",
+        "classification",
+        "path_to_future_approval",
+        "link",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as cf:
         writer = csv.DictWriter(cf, fieldnames=fieldnames)
         writer.writeheader()
         for r in rows:
-            writer.writerow({k: r.get(k, "") for k in fieldnames})
+            file_name = r.get("_file", "")
+            link = f"https://github.com/plainyogurt21/CRLs/blob/main/unapproved_CRLs/{file_name}" if file_name else ""
+            row = {k: r.get(k, "") for k in fieldnames}
+            row["link"] = link
+            writer.writerow(row)
 
-    # Per-file JSONs for inspection
-    for r in rows:
-        fname = r.get("_file", "result")
-        with open(os.path.join(details_dir, f"{fname}.json"), "w", encoding="utf-8") as f:
-            json.dump(r, f, ensure_ascii=False, indent=2)
-
-    print(f"Saved: {jsonl_path} and {csv_path} (and per-file JSONs in details/)")
+    print(f"Saved: {csv_path}")
 
 
 def find_pdfs(input_dir: str) -> List[str]:
@@ -306,13 +275,38 @@ def find_pdfs(input_dir: str) -> List[str]:
     return sorted(paths)
 
 
+def process_batch_parallel(pdf_batch: List[str], batch_num: int, total_batches: int) -> List[Dict[str, Any]]:
+    """Process a batch of PDFs in parallel using ThreadPoolExecutor."""
+    batch_results = []
+    
+    print(f"Processing batch {batch_num}/{total_batches} ({len(pdf_batch)} PDFs)...")
+    
+    with ThreadPoolExecutor(max_workers=len(pdf_batch)) as executor:
+        # Submit all PDFs in the batch
+        future_to_pdf = {executor.submit(parse_pdf_with_llm, pdf): pdf for pdf in pdf_batch}
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_pdf):
+            pdf = future_to_pdf[future]
+            try:
+                result = future.result()
+                if result:
+                    batch_results.append(result)
+                print(f"  ✓ Completed: {os.path.basename(pdf)}")
+            except Exception as e:
+                print(f"  ✗ Error processing {os.path.basename(pdf)}: {e}")
+    
+    return batch_results
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Parse CRL PDFs and extract structured fields with OpenRouter LLM")
-    parser.add_argument("--input", default="CRL Unapprovved", help="Directory containing CRL PDFs")
+    parser.add_argument("--input", default="unapproved_CRLs", help="Directory containing CRL PDFs")
     parser.add_argument("--out", default="outputs", help="Directory to write outputs")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of PDFs to process (0 = all)")
+    parser.add_argument("--batch-size", type=int, default=25, help="Number of PDFs to process in parallel per batch")
     args = parser.parse_args()
 
     os.makedirs(args.input, exist_ok=True)
@@ -324,20 +318,31 @@ def main():
     if args.limit > 0:
         pdfs = pdfs[: args.limit]
 
+    print(f"Found {len(pdfs)} PDFs to process in batches of {args.batch_size}")
+    
+    # Process in batches
     results: List[Dict[str, Any]] = []
-    for i, pdf in enumerate(pdfs, 1):
-        print(f"[{i}/{len(pdfs)}] Processing {pdf}...")
-        data = parse_pdf_with_llm(pdf)
-        if data:
-            results.append(data)
-        time.sleep(0.5)  # small pacing
+    batch_size = args.batch_size
+    total_batches = (len(pdfs) + batch_size - 1) // batch_size
+    
+    for i in range(0, len(pdfs), batch_size):
+        batch_pdfs = pdfs[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        
+        batch_results = process_batch_parallel(batch_pdfs, batch_num, total_batches)
+        results.extend(batch_results)
+        
+        # Small delay between batches to avoid overwhelming the API
+        if batch_num < total_batches:
+            print("Waiting 2 seconds before next batch...")
+            time.sleep(2)
 
     if results:
         write_outputs(results, args.out)
+        print(f"Successfully processed {len(results)}/{len(pdfs)} PDFs")
     else:
         print("No results produced.")
 
 
 if __name__ == "__main__":
     main()
-
